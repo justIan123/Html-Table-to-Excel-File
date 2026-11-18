@@ -1,5 +1,6 @@
 /*
 https://github.com/justIan123/Html-Table-to-Excel-File.git
+https://cdn.jsdelivr.net/gh/justIan123/Html-Table-to-Excel-File/index.js
 */
 
 
