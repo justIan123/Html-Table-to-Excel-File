@@ -1,0 +1,341 @@
+/*
+https://github.com/justIan123/Html-Table-to-Excel-File.git
+*/
+
+
+/* ---------- Table to Excel ----------
+tableToExcel({ root: '#customersBox', filename: 'customers', ignore: '#ignoreAnotherTableIfExixst' })
+
+- every <table> inside `root` becomes one sheet of the .xlsx file
+- leave a table, a row, or a column out by putting data-export="ignore" on the
+    <table>, on the <tr>, or on the <th> and <td> of that column
+- or leave tables out from the call with the `ignore` option (a CSS selector)
+- sheet name: data-sheet="..." on the <table>, else its <caption>, else "Table 1", "Table 2"...
+- an <input>, <select> or <textarea> inside a cell exports its current value
+- plain numbers become numbers in Excel (0912 stays text), everything else is text
+No library needed, so it also works offline.
+*/
+
+
+(function () {
+const MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+const REL  = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+const SKIP = '[data-export="ignore"]';
+// written in two pieces so PHP never mistakes it for an opening tag
+const XML_HEAD = '<' + '?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+const encoder  = new TextEncoder();
+
+/* ----- small helpers ----- */
+
+// 0 => A, 25 => Z, 26 => AA
+function columnLetter(index) {
+    let letters = '';
+    for (let n = index + 1; n > 0; n = Math.floor((n - 1) / 26)) {
+    letters = String.fromCharCode(65 + (n - 1) % 26) + letters;
+    }
+    return letters;
+}
+
+// text that is safe inside XML (drops control characters, escapes & < > " ')
+function esc(value) {
+    return String(value)
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F￾￿]/g, '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+}
+
+// Excel sheet names: max 31 characters, none of [ ] : * ? / \, and no two the same
+function uniqueSheetName(wanted, used, fallback) {
+    let base = String(wanted).replace(/[\[\]:*?\/\\]/g, ' ').replace(/\s+/g, ' ').trim().replace(/^'+|'+$/g, '');
+    base = Array.from(base || fallback).slice(0, 31).join('');
+
+    let name = base;
+    for (let i = 2; used.has(name.toLowerCase()); i++) {
+    const suffix = ' (' + i + ')';
+    name = Array.from(base).slice(0, 31 - suffix.length).join('') + suffix;
+    }
+    used.add(name.toLowerCase());
+    return name;
+}
+
+/* ----- 1. read the tables ----- */
+
+function cellText(cell) {
+    const control = cell.querySelector(
+    'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]), select, textarea'
+    );
+    let text;
+    if (control && control.tagName === 'SELECT') {
+    text = control.selectedOptions[0] ? control.selectedOptions[0].text : '';
+    } else if (control) {
+    text = control.value;
+    } else {
+    text = cell.textContent;
+    }
+    return text.replace(/\s+/g, ' ').trim();
+}
+
+// one table => { rows: [[text|null, ...], ...], header: true|false, cols: number }
+function readTable(table) {
+    const rows = [];
+    let header = false;
+    let cols   = 0;
+
+    Array.from(table.rows).forEach(function (tr) {
+    const cells = [];
+    let onlyHeaders = true;
+
+    Array.from(tr.cells).forEach(function (cell) {
+        if (cell.closest(SKIP)) return;               // ignored column, row or table
+        if (cell.tagName !== 'TH') onlyHeaders = false;
+
+        const text = cellText(cell);
+        cells.push(text === '' ? null : text);
+        for (let i = 1; i < cell.colSpan; i++) cells.push(null);   // keep the next columns lined up
+    });
+
+    if (!cells.length) return;                      // nothing left in this row
+    if (rows.length === 0 && onlyHeaders) header = true;   // a first row of <th> is the header
+    cols = Math.max(cols, cells.length);
+    rows.push(cells);
+    });
+
+    return { rows: rows, header: header, cols: cols };
+}
+
+/* ----- 2. build the .xlsx ----- */
+
+function sheetXml(sheet) {
+    const widths = new Array(sheet.cols).fill(0);
+    let data = '';
+
+    sheet.rows.forEach(function (row, r) {
+    const isHeader = sheet.header && r === 0;
+    data += '<row r="' + (r + 1) + '">';
+
+    row.forEach(function (text, c) {
+        if (text === null) return;                    // empty cell
+
+        const ref = columnLetter(c) + (r + 1);
+        widths[c] = Math.max(widths[c], Array.from(text).length);
+
+        if (!isHeader && /^-?(0|[1-9]\d{0,14})(\.\d+)?$/.test(text)) {
+        data += '<c r="' + ref + '"><v>' + text + '</v></c>';
+        } else {
+        data += '<c r="' + ref + '"' + (isHeader ? ' s="1"' : '') + ' t="inlineStr">'
+                + '<is><t xml:space="preserve">' + esc(text) + '</t></is></c>';
+        }
+    });
+
+    data += '</row>';
+    });
+
+    // column widths: longest value + a little room, between 8 and 60
+    let colsXml = '';
+    widths.forEach(function (w, c) {
+    colsXml += '<col min="' + (c + 1) + '" max="' + (c + 1) + '" width="' + Math.min(60, Math.max(8, w + 3)) + '" customWidth="1"/>';
+    });
+
+    const range = 'A1:' + columnLetter(sheet.cols - 1) + sheet.rows.length;
+
+    return XML_HEAD
+    + '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+    + '<dimension ref="' + range + '"/>'
+    + (sheet.header
+        ? '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+        : '')
+    + '<cols>' + colsXml + '</cols>'
+    + '<sheetData>' + data + '</sheetData>'
+    + (sheet.header ? '<autoFilter ref="' + range + '"/>' : '')
+    + '</worksheet>';
+}
+
+// style 0 = normal, style 1 = header (bold + grey)
+const STYLES_XML = XML_HEAD
+    + '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+    + '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>'
+    + '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>'
+    +   '<fill><patternFill patternType="solid"><fgColor rgb="FFE7E6E6"/><bgColor indexed="64"/></patternFill></fill></fills>'
+    + '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+    + '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+    + '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+    +   '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/></cellXfs>'
+    + '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+    + '</styleSheet>';
+
+// all the files that make up the workbook: [{ name, data }]
+function workbookFiles(sheets) {
+    let sheetTags = '', overrides = '', relationships = '', filters = '';
+
+    sheets.forEach(function (sheet, i) {
+    const id = i + 1;
+    sheetTags     += '<sheet name="' + esc(sheet.name) + '" sheetId="' + id + '" r:id="rId' + id + '"/>';
+    overrides     += '<Override PartName="/xl/worksheets/sheet' + id + '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>';
+    relationships += '<Relationship Id="rId' + id + '" Type="' + REL + '/worksheet" Target="worksheets/sheet' + id + '.xml"/>';
+
+    if (sheet.header) {   // the filter range, written the way Excel wants it:  'Students'!$A$1:$G$11
+        filters += '<definedName name="_xlnm._FilterDatabase" localSheetId="' + i + '" hidden="1">'
+                + esc("'" + sheet.name.replace(/'/g, "''") + "'!$A$1:$" + columnLetter(sheet.cols - 1) + '$' + sheet.rows.length)
+                + '</definedName>';
+    }
+    });
+
+    const stylesId = sheets.length + 1;
+    const files = [
+    ['[Content_Types].xml', XML_HEAD
+        + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        + '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        + '<Default Extension="xml" ContentType="application/xml"/>'
+        + '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        + '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        + overrides + '</Types>'],
+
+    ['_rels/.rels', XML_HEAD
+        + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + '<Relationship Id="rId1" Type="' + REL + '/officeDocument" Target="xl/workbook.xml"/></Relationships>'],
+
+    ['xl/workbook.xml', XML_HEAD
+        + '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="' + REL + '">'
+        + '<sheets>' + sheetTags + '</sheets>'
+        + (filters ? '<definedNames>' + filters + '</definedNames>' : '')
+        + '</workbook>'],
+
+    ['xl/_rels/workbook.xml.rels', XML_HEAD
+        + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + relationships
+        + '<Relationship Id="rId' + stylesId + '" Type="' + REL + '/styles" Target="styles.xml"/></Relationships>'],
+
+    ['xl/styles.xml', STYLES_XML]
+    ];
+
+    sheets.forEach(function (sheet, i) {
+    files.push(['xl/worksheets/sheet' + (i + 1) + '.xml', sheetXml(sheet)]);
+    });
+
+    return files.map(function (f) { return { name: f[0], data: encoder.encode(f[1]) }; });
+}
+
+/* ----- 3. zip (no compression, so no library is needed) ----- */
+
+const CRC_TABLE = (function () {
+    const table = [];
+    for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    table[n] = c >>> 0;
+    }
+    return table;
+})();
+
+function crc32(bytes) {
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+function zip(files) {
+    const now     = new Date();
+    const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+    const dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+
+    const parts = [];      // local entries
+    const central = [];    // central directory
+    let offset = 0;
+
+    files.forEach(function (file) {
+    const name = encoder.encode(file.name);
+    const crc  = crc32(file.data);
+    const size = file.data.length;
+
+    const local = new DataView(new ArrayBuffer(30));
+    local.setUint32(0, 0x04034b50, true);
+    local.setUint16(4, 20, true);              // version needed
+    local.setUint16(6, 0x0800, true);          // names are UTF-8
+    local.setUint16(8, 0, true);               // 0 = stored (no compression)
+    local.setUint16(10, dosTime, true);
+    local.setUint16(12, dosDate, true);
+    local.setUint32(14, crc, true);
+    local.setUint32(18, size, true);
+    local.setUint32(22, size, true);
+    local.setUint16(26, name.length, true);
+    local.setUint16(28, 0, true);
+    parts.push(new Uint8Array(local.buffer), name, file.data);
+
+    const entry = new DataView(new ArrayBuffer(46));
+    entry.setUint32(0, 0x02014b50, true);
+    entry.setUint16(4, 20, true);              // version made by
+    entry.setUint16(6, 20, true);              // version needed
+    entry.setUint16(8, 0x0800, true);
+    entry.setUint16(10, 0, true);
+    entry.setUint16(12, dosTime, true);
+    entry.setUint16(14, dosDate, true);
+    entry.setUint32(16, crc, true);
+    entry.setUint32(20, size, true);
+    entry.setUint32(24, size, true);
+    entry.setUint16(28, name.length, true);
+    entry.setUint32(42, offset, true);         // where the local entry starts
+    central.push(new Uint8Array(entry.buffer), name);
+
+    offset += 30 + name.length + size;
+    });
+
+    let centralSize = 0;
+    central.forEach(function (p) { centralSize += p.length; });
+
+    const end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0, 0x06054b50, true);
+    end.setUint16(8, files.length, true);
+    end.setUint16(10, files.length, true);
+    end.setUint32(12, centralSize, true);
+    end.setUint32(16, offset, true);
+
+    return new Blob(parts.concat(central, [new Uint8Array(end.buffer)]), { type: MIME });
+}
+
+/* ----- 4. the function you call ----- */
+
+window.tableToExcel = function (options) {
+    options = options || {};
+
+    const root = typeof options.root === 'string' ? document.querySelector(options.root) : (options.root || document);
+    const used = new Set();
+    const sheets = [];
+
+    if (root) {
+    root.querySelectorAll('table').forEach(function (table) {
+        if (table.closest(SKIP)) return;                                  // data-export="ignore"
+        if (options.ignore && table.closest(options.ignore)) return;      // the ignore option
+        if (table.parentElement && table.parentElement.closest('table')) return;   // a table inside a cell
+
+        const sheet = readTable(table);
+        if (!sheet.rows.length) return;
+
+        const caption = table.caption ? table.caption.textContent : '';
+        sheet.name = uniqueSheetName(table.dataset.sheet || caption, used, 'Table ' + (sheets.length + 1));
+        sheets.push(sheet);
+    });
+    }
+
+    if (!sheets.length) {
+    const message = 'There is no table on this page to export.';
+    if (window.Swal) Swal.fire({ icon: 'info', title: 'Nothing to export', text: message });
+    else alert(message);
+    return 0;
+    }
+
+    const d     = new Date();
+    const stamp = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    const base  = String(options.filename || 'table').replace(/\.xlsx$/i, '').replace(/[^\w.-]+/g, '_');
+
+    const url  = URL.createObjectURL(zip(workbookFiles(sheets)));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = base + '_' + stamp + '.xlsx';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+
+    return sheets.length;
+};
+})();
